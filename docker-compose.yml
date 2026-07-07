@@ -1,0 +1,35 @@
+version: "3.8"
+services:
+  fleet-agent:
+    image: 13.140.141.3:5000/fleet-agent:latest
+    container_name: fleet-agent
+    restart: unless-stopped
+    environment:
+      NODE_LABEL: ${NODE_LABEL:-de}
+      REDIS_URL: redis://:VIp0nlN1-Wiffa2MgRpmyqLpaEJzG8Jj@dokploy-redis:6379
+      FLEETDEPLOY_BACKEND_URL: ${FLEETDEPLOY_BACKEND_URL:-https://web-production-946ce.up.railway.app}
+      AGENT_SECRET: ${AGENT_SECRET:-change-me}
+      CLAUDE_API_KEY: ${CLAUDE_API_KEY}
+      SCALE_CPU_THRESHOLD: "80"
+      SCALE_CONSECUTIVE: "3"
+      LOOP_INTERVAL: "30"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - dokploy-network
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true
+
+volumes:
+  ollama_data:
