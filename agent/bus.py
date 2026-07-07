@@ -36,6 +36,10 @@ async def get_all_peers(r) -> dict:
     return dict(_peer_cache)
 
 
+_GOSSIP_KEEP = {"node_label", "ip", "cpu_pct", "mem_pct", "disk_pct",
+                "containers_running", "status", "current_task", "last_seen"}
+
+
 async def fetch_peers_from_backend(client) -> dict:
     """Fetch all agent states from FleetDeploy backend and cache them."""
     global _peer_cache
@@ -43,7 +47,10 @@ async def fetch_peers_from_backend(client) -> dict:
         resp = await client.get("/admin/agents",
                                 headers={"X-Admin-Secret": "Apple22244"})
         data = resp.json()
-        _peer_cache = {a["node_label"]: a for a in (data.get("agents") or [])}
+        _peer_cache = {
+            a["node_label"]: {k: v for k, v in a.items() if k in _GOSSIP_KEEP}
+            for a in (data.get("agents") or [])
+        }
     except Exception as e:
         log.debug(f"Peer fetch failed: {e}")
     return dict(_peer_cache)
