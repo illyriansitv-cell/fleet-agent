@@ -67,22 +67,16 @@ async def should_scale_out(metrics: dict, peer_states: dict) -> tuple[bool, str]
         return False, f"LLM unavailable: {e}"
 
 
-async def handle_directive(directive: str, metrics: dict) -> str:
+async def handle_directive(directive: str, metrics: dict) -> dict:
+    """Execute a directive. Returns structured result dict."""
     try:
-        prompt = (
-            f"You are a fleet agent running on server {NODE_LABEL}. "
-            f"You received this directive: {directive}\n"
-            f"Current metrics: CPU={metrics['cpu_pct']}%, MEM={metrics['mem_pct']}%, "
-            f"disk={metrics['disk_pct']}%, containers={metrics['containers_running']}.\n"
-            "What action should you take? Reply with ACTION: <action> and RESULT: <what you did>."
-        )
+        from agent.executor import execute_directive
         claude = _get_claude()
-        msg = await claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return msg.content[0].text.strip()
+        result = await execute_directive(directive, metrics, claude)
+        return result
     except Exception as e:
-        log.warning(f"Claude directive handler failed: {e}")
-        return f"ACTION: none\nRESULT: LLM unavailable — {e}"
+        log.warning(f"Directive execution failed: {e}")
+        return {
+            "action_type": "noop", "reasoning": str(e),
+            "ok": False, "output": f"Execution error: {e}", "raw_plan": "",
+        }

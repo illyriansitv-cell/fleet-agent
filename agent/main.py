@@ -73,15 +73,29 @@ async def main():
                 state = {**m, "status": status, "task": task, "node_label": NODE_LABEL, "ip": ip}
                 await bus.publish_state(redis, NODE_LABEL, state)
 
-                directive = await reporter.heartbeat(client, NODE_LABEL, m, status, task, peers)
+                hb = await reporter.heartbeat(client, NODE_LABEL, m, status, task, peers)
+                directive    = hb.get("directive")   if hb else None
+                directive_id = hb.get("directive_id") if hb else None
                 if directive:
                     log.info(f"Directive received: {directive}")
+                    task = "executing"
                     result = await llm.handle_directive(directive, m)
                     await reporter.log_event(
-                        client, NODE_LABEL, "action",
-                        f"Directive executed: {directive[:80]}",
-                        {"result": result},
+                        client, NODE_LABEL,
+                        "action" if result.get("ok") else "error",
+                        f"[{result.get('action_type','?')}] {directive[:60]} → "
+                        f"{'OK' if result.get('ok') else 'FAILED'}: {result.get('output','')[:120]}",
+                        {
+                            "directive": directive,
+                            "action_type": result.get("action_type"),
+                            "ok": result.get("ok"),
+                            "output": result.get("output", "")[:500],
+                            "reasoning": result.get("reasoning", ""),
+                        },
                     )
+                    if directive_id:
+                        await reporter.complete_directive(client, directive_id, result)
+                    task = "monitoring"
 
             except Exception as e:
                 log.error(f"Agent loop error: {e}", exc_info=True)
