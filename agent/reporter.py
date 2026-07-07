@@ -20,7 +20,7 @@ async def heartbeat(client, node_label: str, metrics: dict, status: str, task: s
         })
         return resp.json()
     except Exception as e:
-        log.warning(f"Heartbeat failed: {e}")
+        log.warning(f"Heartbeat failed: {type(e).__name__}: {e!r}")
         return {}
 
 
@@ -33,7 +33,7 @@ async def log_event(client, node_label: str, event_type: str, message: str, meta
             "metadata": metadata,
         })
     except Exception as e:
-        log.warning(f"Event log failed: {e}")
+        log.warning(f"Event log failed: {type(e).__name__}: {e!r}")
 
 
 async def complete_directive(client, directive_id: str, result: dict) -> None:
