@@ -30,7 +30,8 @@ async def main():
         while True:
             try:
                 m = await metrics.collect()
-                peers = await bus.get_all_peers(redis)
+                peers = await bus.fetch_peers_from_backend(client)
+                await bus.get_all_peers(redis)  # also try local Redis, updates cache silently
 
                 if m["cpu_pct"] > 90 or m["mem_pct"] > 90:
                     status = "critical"
