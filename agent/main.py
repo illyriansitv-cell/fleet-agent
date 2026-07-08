@@ -18,7 +18,28 @@ AGENT_SECRET = os.environ.get("AGENT_SECRET", "")
 SCALE_CPU_THRESHOLD = float(os.environ.get("SCALE_CPU_THRESHOLD", "80"))
 SCALE_CONSECUTIVE = int(os.environ.get("SCALE_CONSECUTIVE", "3"))
 LOOP_INTERVAL = int(os.environ.get("LOOP_INTERVAL", "60"))
-PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))  # fetch peers every 5 min
+PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))
+FD_HEALTH_CHECK_INTERVAL = int(os.environ.get("FD_HEALTH_CHECK_INTERVAL", "300"))
+
+
+async def _ensure_fd_health() -> str | None:
+    """
+    Check that the fd-health (whoami) container is running on this node.
+    If it's stopped or missing, recreate it. Returns a log message if action
+    was taken, None if everything was already fine.
+    """
+    status = await metrics._run(
+        "docker inspect fd-health --format '{{.State.Running}}' 2>/dev/null"
+    )
+    if status.strip() == "true":
+        return None
+    # Container is stopped or missing — recreate it.
+    await metrics._run(
+        "docker rm -f fd-health 2>/dev/null || true && "
+        "docker run -d --name fd-health --network dokploy-network "
+        "--restart unless-stopped traefik/whoami:latest 2>/dev/null"
+    )
+    return f"fd-health was {'stopped' if status.strip() == 'false' else 'missing'} — recreated standalone container"
 
 
 async def main():
@@ -27,6 +48,7 @@ async def main():
     headers = {"X-Agent-Secret": AGENT_SECRET}
     high_cpu_streak = 0
     last_peer_fetch = 0.0
+    last_fd_health_check = 0.0
 
     async with httpx.AsyncClient(base_url=BACKEND_URL, headers=headers, timeout=15) as client:
         while True:
@@ -75,6 +97,17 @@ async def main():
                         task = "monitoring"
                 else:
                     high_cpu_streak = max(0, high_cpu_streak - 1)
+
+                now = asyncio.get_event_loop().time()
+                if now - last_fd_health_check >= FD_HEALTH_CHECK_INTERVAL:
+                    heal_msg = await _ensure_fd_health()
+                    last_fd_health_check = now
+                    if heal_msg:
+                        log.warning(f"[self-heal] {heal_msg}")
+                        await reporter.log_event(
+                            client, NODE_LABEL, "action",
+                            f"[self-heal] {heal_msg}", {},
+                        )
 
                 ip = socket.gethostbyname(socket.gethostname())
                 state = {**m, "status": status, "task": task, "node_label": NODE_LABEL, "ip": ip}
