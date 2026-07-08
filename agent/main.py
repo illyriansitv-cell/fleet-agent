@@ -17,7 +17,8 @@ BACKEND_URL = os.environ.get("FLEETDEPLOY_BACKEND_URL", "")
 AGENT_SECRET = os.environ.get("AGENT_SECRET", "")
 SCALE_CPU_THRESHOLD = float(os.environ.get("SCALE_CPU_THRESHOLD", "80"))
 SCALE_CONSECUTIVE = int(os.environ.get("SCALE_CONSECUTIVE", "3"))
-LOOP_INTERVAL = int(os.environ.get("LOOP_INTERVAL", "30"))
+LOOP_INTERVAL = int(os.environ.get("LOOP_INTERVAL", "60"))
+PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))  # fetch peers every 5 min
 
 
 async def main():
@@ -25,13 +26,19 @@ async def main():
     redis = aioredis.from_url(REDIS_URL, decode_responses=True)
     headers = {"X-Agent-Secret": AGENT_SECRET}
     high_cpu_streak = 0
+    last_peer_fetch = 0.0
 
     async with httpx.AsyncClient(base_url=BACKEND_URL, headers=headers, timeout=15) as client:
         while True:
             try:
                 m = await metrics.collect()
-                peers = await bus.fetch_peers_from_backend(client)
+
+                now = asyncio.get_event_loop().time()
+                if now - last_peer_fetch >= PEER_FETCH_INTERVAL:
+                    await bus.fetch_peers_from_backend(client)
+                    last_peer_fetch = now
                 await bus.get_all_peers(redis)  # also try local Redis, updates cache silently
+                peers = bus.get_cached_peers()
 
                 if m["cpu_pct"] > 90 or m["mem_pct"] > 90:
                     status = "critical"

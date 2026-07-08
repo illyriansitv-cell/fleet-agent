@@ -19,6 +19,11 @@ async def publish_state(r, node_label: str, state: dict) -> None:
         pass  # Redis unavailable on this node — backend is source of truth
 
 
+def get_cached_peers() -> dict:
+    """Return in-memory peer cache without any I/O."""
+    return dict(_peer_cache)
+
+
 async def get_all_peers(r) -> dict:
     """Return peer cache (populated by fetch_peers_from_backend)."""
     try:
