@@ -2,38 +2,83 @@ import os
 import json
 import logging
 import httpx
-import anthropic
 
 log = logging.getLogger("fleet-agent.llm")
 
 NODE_LABEL = os.environ.get("NODE_LABEL", "unknown")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-_claude = None
+
+# Active config — updated dynamically from heartbeat response
+_cfg: dict = {
+    "provider": os.environ.get("LLM_PROVIDER", "anthropic"),
+    "model":    os.environ.get("LLM_MODEL", "claude-haiku-4-5-20251001"),
+    "base_url": os.environ.get("LLM_BASE_URL", ""),
+    "api_key":  os.environ.get("LLM_API_KEY") or os.environ.get("CLAUDE_API_KEY", ""),
+}
 
 
-def _get_claude() -> anthropic.AsyncAnthropic:
-    global _claude
-    if _claude is None:
-        _claude = anthropic.AsyncAnthropic(api_key=os.environ["CLAUDE_API_KEY"])
-    return _claude
+def update_config(cfg: dict) -> None:
+    """Called from main.py when heartbeat returns llm_config. Takes effect next LLM call."""
+    for k in ("provider", "model", "base_url", "api_key"):
+        if cfg.get(k):
+            _cfg[k] = cfg[k]
+    log.info("LLM config updated: provider=%s model=%s", _cfg["provider"], _cfg["model"])
+
+
+async def _chat(system_prompt: str, user_msg: str, max_tokens: int = 300) -> str:
+    """Provider-agnostic chat completion. Returns text or raises."""
+    provider = _cfg["provider"]
+    model    = _cfg["model"]
+    api_key  = _cfg["api_key"]
+
+    if provider == "anthropic":
+        import anthropic
+        client = anthropic.AsyncAnthropic(api_key=api_key)
+        msg = await client.messages.create(
+            model=model, max_tokens=max_tokens,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        return msg.content[0].text.strip()
+
+    if provider == "ollama":
+        base_url = _cfg.get("base_url") or OLLAMA_URL
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(
+                f"{base_url}/api/generate",
+                json={"model": model, "prompt": f"{system_prompt}\n\n{user_msg}", "stream": False},
+            )
+            resp.raise_for_status()
+            return resp.json().get("response", "").strip()
+
+    if provider == "gemini":
+        base_url = _cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai"
+        async with httpx.AsyncClient(timeout=30) as c:
+            resp = await c.post(
+                f"{base_url}/chat/completions",
+                headers={"Authorization": f"Bearer {api_key}"},
+                json={
+                    "model": model,
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_msg},
+                    ],
+                    "max_tokens": max_tokens,
+                },
+            )
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+
+    raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
 async def classify_errors(errors: list[str]) -> str:
     try:
-        prompt = (
-            "You are a server monitoring assistant. "
-            "Classify these errors in 1-2 sentences:\n"
-            + "\n".join(errors[:20])
-        )
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": "qwen2.5:0.5b", "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            return resp.json().get("response", "").strip() or "classification unavailable"
+        system = "You are a server monitoring assistant. Classify these errors in 1-2 sentences."
+        user   = "\n".join(errors[:20])
+        return await _chat(system, user, max_tokens=100)
     except Exception as e:
-        log.warning(f"Ollama classify failed: {e}")
+        log.warning("classify_errors failed: %s", e)
         return "classification unavailable"
 
 
@@ -44,38 +89,29 @@ async def should_scale_out(metrics: dict, peer_states: dict) -> tuple[bool, str]
             for k, v in peer_states.items()
             if k != NODE_LABEL
         }
-        prompt = (
-            f"Fleet node {NODE_LABEL} metrics: CPU={metrics['cpu_pct']}%, "
+        system = "You are a fleet scaling assistant. Answer YES or NO and one sentence why."
+        user = (
+            f"Fleet node {NODE_LABEL}: CPU={metrics['cpu_pct']}%, "
             f"MEM={metrics['mem_pct']}%, containers={metrics['containers_running']}, "
             f"errors_5m={metrics['error_count_5m']}.\n"
-            f"Peer nodes: {json.dumps(peers_summary)}.\n"
-            "Should we scale out to a new Hetzner VPS to handle this load? "
-            "Answer YES or NO and one sentence why."
+            f"Peers: {json.dumps(peers_summary)}.\n"
+            "Should we scale out to a new VPS to handle this load?"
         )
-        claude = _get_claude()
-        msg = await claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=100,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = msg.content[0].text.strip()
-        should = text.upper().startswith("YES")
-        reason = text.split("\n")[0] if "\n" in text else text
-        return should, reason
+        text = await _chat(system, user, max_tokens=100)
+        return text.upper().startswith("YES"), text.split("\n")[0]
     except Exception as e:
-        log.warning(f"Claude scale-out check failed: {e}")
+        log.warning("should_scale_out failed: %s", e)
         return False, f"LLM unavailable: {e}"
 
 
 async def handle_directive(directive: str, metrics: dict) -> dict:
-    """Execute a directive. Returns structured result dict."""
+    """Execute a free-text directive via LLM classification. Returns structured result dict."""
     try:
         from agent.executor import execute_directive
-        claude = _get_claude()
-        result = await execute_directive(directive, metrics, claude)
+        result = await execute_directive(directive, metrics)
         return result
     except Exception as e:
-        log.warning(f"Directive execution failed: {e}")
+        log.warning("Directive execution failed: %s", e)
         return {
             "action_type": "noop", "reasoning": str(e),
             "ok": False, "output": f"Execution error: {e}", "raw_plan": "",

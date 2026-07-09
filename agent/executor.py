@@ -36,6 +36,10 @@ ALLOWED_ACTIONS = {
     "stack_list",         # docker stack ls
     "disk_cleanup",       # docker system prune -f
     "node_status",        # docker node ls
+    # Structured maintenance actions (sent as JSON by backend cron — no LLM needed)
+    "fix_traefik_routes", # scan /etc/traefik/dynamic, fix stale container IPs
+    "registry_cleanup",   # GC + prune on local registry (manager only)
+    "swarm_health_report",# docker node ls → report node status
     "noop",               # acknowledge, take no action
 }
 
@@ -74,6 +78,115 @@ async def _exec(cmd: str, timeout: int = CMD_TIMEOUT) -> tuple[int, str, str]:
         return 1, "", f"Command timed out after {timeout}s"
     except Exception as e:
         return 1, "", str(e)
+
+
+async def _fix_traefik_routes(dynamic_dir: str = "/etc/traefik/dynamic") -> dict:
+    """Scan Traefik dynamic config dir, replace stale container IPs with live ones."""
+    # Build map of live container IPs and their exposed ports on dokploy-network
+    _, out, _ = await _exec(
+        "docker inspect "
+        "$(docker ps -q --filter 'network=dokploy-network' 2>/dev/null) "
+        "--format '{{(index .NetworkSettings.Networks \"dokploy-network\").IPAddress}} "
+        "{{json .Config.ExposedPorts}}' 2>/dev/null || true",
+        timeout=15,
+    )
+    valid_ips: set = set()
+    port_to_ip: dict = {}
+    for line in out.strip().splitlines():
+        parts = line.strip().split(" ", 1)
+        if not parts:
+            continue
+        ip = parts[0].strip()
+        if ip:
+            valid_ips.add(ip)
+        if len(parts) >= 2:
+            try:
+                for port_proto in (json.loads(parts[1]) or {}):
+                    port = port_proto.split("/")[0]
+                    if port not in port_to_ip and ip:
+                        port_to_ip[port] = ip
+            except Exception:
+                pass
+
+    _, files_out, _ = await _exec(
+        f"grep -rlE 'http://(10|172)\\.' {dynamic_dir} 2>/dev/null || true",
+        timeout=10,
+    )
+
+    fixed = []
+    for file_path in files_out.strip().splitlines():
+        file_path = file_path.strip()
+        if not file_path:
+            continue
+        try:
+            with open(file_path) as f:
+                content = f.read()
+        except Exception:
+            continue
+        new_content = content
+        for m in re.finditer(r"http://(\d+\.\d+\.\d+\.\d+):(\d+)", content):
+            stale_ip, port = m.group(1), m.group(2)
+            if stale_ip in valid_ips:
+                continue
+            new_ip = port_to_ip.get(port)
+            if not new_ip:
+                continue
+            new_content = new_content.replace(f"http://{stale_ip}:{port}", f"http://{new_ip}:{port}")
+            fixed.append({"file": file_path, "old_ip": stale_ip, "new_ip": new_ip, "port": port})
+        if new_content != content:
+            try:
+                with open(file_path, "w") as f:
+                    f.write(new_content)
+            except Exception as e:
+                return {"ok": False, "output": f"Write failed {file_path}: {e}"}
+
+    msg = f"Fixed {len(fixed)} stale route(s)" + (f": {fixed}" if fixed else " — all clean")
+    return {"ok": True, "output": msg}
+
+
+async def _registry_cleanup(registry_url: str = "http://localhost:5000", keep_tags: int = 5) -> dict:
+    """Delete old tags from local registry, run GC, prune dangling images."""
+    import json as _json
+    _, catalog_out, _ = await _exec(f"curl -s {registry_url}/v2/_catalog 2>/dev/null", timeout=20)
+    try:
+        repos = _json.loads(catalog_out).get("repositories", [])
+    except Exception:
+        repos = []
+
+    deleted: list[str] = []
+    for repo in repos:
+        try:
+            _, tags_out, _ = await _exec(
+                f"curl -s {registry_url}/v2/{repo}/tags/list 2>/dev/null", timeout=10
+            )
+            tags = (_json.loads(tags_out).get("tags") or [])
+            for tag in tags[:-keep_tags]:
+                _, digest_out, _ = await _exec(
+                    f"curl -sI -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' "
+                    f"{registry_url}/v2/{repo}/manifests/{tag} 2>/dev/null | "
+                    f"grep -i Docker-Content-Digest | awk '{{print $2}}' | tr -d '\\r'",
+                    timeout=10,
+                )
+                digest = digest_out.strip()
+                if digest:
+                    await _exec(
+                        f"curl -s -X DELETE {registry_url}/v2/{repo}/manifests/{digest} 2>/dev/null",
+                        timeout=10,
+                    )
+                    deleted.append(f"{repo}:{tag}")
+        except Exception:
+            pass
+
+    _, gc_out, _ = await _exec(
+        "docker exec $(docker ps -q --filter name=registry 2>/dev/null | head -1) "
+        "registry garbage-collect /etc/docker/registry/config.yml 2>&1 | tail -3",
+        timeout=60,
+    )
+    _, prune_out, _ = await _exec("docker image prune -f 2>&1 | tail -2", timeout=30)
+    return {
+        "ok": True,
+        "output": f"Deleted {len(deleted)} tags. GC: {gc_out[:120]}. Prune: {prune_out[:80]}",
+    }
 
 
 async def _dispatch(action: dict) -> dict:
@@ -161,6 +274,19 @@ async def _dispatch(action: dict) -> dict:
         rc, out, err = await _exec("docker node ls 2>&1")
         return {"ok": rc == 0, "output": out or err}
 
+    if atype == "fix_traefik_routes":
+        return await _fix_traefik_routes(action.get("dynamic_dir", "/etc/traefik/dynamic"))
+
+    if atype == "registry_cleanup":
+        return await _registry_cleanup(
+            action.get("registry_url", "http://localhost:5000"),
+            int(action.get("keep_tags", 5)),
+        )
+
+    if atype == "swarm_health_report":
+        rc, out, err = await _exec("docker node ls --format json 2>&1", timeout=15)
+        return {"ok": rc == 0, "output": (out or err)[:2000]}
+
     return {"ok": False, "output": f"Unhandled action type: {atype}"}
 
 
@@ -190,15 +316,14 @@ Rules:
 """
 
 
-async def execute_directive(directive: str, metrics: dict, claude) -> dict:
+async def execute_directive(directive: str, metrics: dict) -> dict:
     """
     Two-phase execution:
-      1. Claude classifies the directive → structured JSON action
+      1. LLM classifies the directive → structured JSON action
       2. _dispatch() validates + runs the action
-
-    Returns:
-      action_type, reasoning, ok, output, raw_plan
     """
+    from agent import llm as _llm
+
     user_msg = (
         f"Node: {NODE_LABEL}  "
         f"CPU={metrics.get('cpu_pct')}%  MEM={metrics.get('mem_pct')}%  "
@@ -210,14 +335,8 @@ async def execute_directive(directive: str, metrics: dict, claude) -> dict:
     action: dict = {"action_type": "noop"}
 
     try:
-        msg = await claude.messages.create(
-            model="claude-haiku-4-5-20251001",
-            max_tokens=300,
-            system=_CLASSIFY_SYSTEM,
-            messages=[{"role": "user", "content": user_msg}],
-        )
-        raw_plan = msg.content[0].text.strip()
-        # Strip markdown code fences if Claude adds them
+        raw_plan = await _llm._chat(_CLASSIFY_SYSTEM, user_msg, max_tokens=300)
+        # Strip markdown code fences if model adds them
         if raw_plan.startswith("```"):
             raw_plan = raw_plan.split("```")[1]
             if raw_plan.startswith("json\n"):

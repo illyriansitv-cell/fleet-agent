@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import logging
 import socket
@@ -7,6 +8,7 @@ import httpx
 import redis.asyncio as aioredis
 
 from . import metrics, llm, bus, reporter
+from .executor import _dispatch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("fleet-agent")
@@ -116,10 +118,30 @@ async def main():
                 hb = await reporter.heartbeat(client, NODE_LABEL, m, status, task, peers)
                 directive    = hb.get("directive")   if hb else None
                 directive_id = hb.get("directive_id") if hb else None
+                # Update LLM config if backend sent new settings
+                llm_config = hb.get("llm_config") if hb else None
+                if llm_config:
+                    llm.update_config(llm_config)
+
                 if directive:
                     log.info(f"Directive received: {directive}")
                     task = "executing"
-                    result = await llm.handle_directive(directive, m)
+                    # Structured JSON directive → bypass LLM, dispatch directly
+                    try:
+                        action = json.loads(directive)
+                        if isinstance(action, dict) and "action_type" in action:
+                            res = await _dispatch(action)
+                            result = {
+                                "action_type": action["action_type"],
+                                "reasoning": action.get("reasoning", "structured action"),
+                                "ok": res["ok"],
+                                "output": res["output"],
+                                "raw_plan": "",
+                            }
+                        else:
+                            raise ValueError("not a structured action")
+                    except (json.JSONDecodeError, ValueError):
+                        result = await llm.handle_directive(directive, m)
                     await reporter.log_event(
                         client, NODE_LABEL,
                         "action" if result.get("ok") else "error",
