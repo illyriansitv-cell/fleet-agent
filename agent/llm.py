@@ -25,6 +25,18 @@ def update_config(cfg: dict) -> None:
     log.info("LLM config updated: provider=%s model=%s", _cfg["provider"], _cfg["model"])
 
 
+_prompt_overrides: dict = {}
+
+def update_prompts(prompts: dict) -> None:
+    """Called from main.py when heartbeat returns agent_prompts. Overrides hardcoded system prompts."""
+    global _prompt_overrides
+    _prompt_overrides = prompts or {}
+
+def _get_prompt(key: str, default: str) -> str:
+    """Return admin-configured prompt override, or fall back to hardcoded default."""
+    return _prompt_overrides.get(key) or default
+
+
 async def _chat(system_prompt: str, user_msg: str, max_tokens: int = 300) -> str:
     """Provider-agnostic chat completion. Returns text or raises."""
     provider = _cfg["provider"]
@@ -72,9 +84,29 @@ async def _chat(system_prompt: str, user_msg: str, max_tokens: int = 300) -> str
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
 
+async def list_ollama_models() -> list[dict]:
+    """Query local Ollama for installed models. Returns [] if Ollama unreachable."""
+    try:
+        base_url = _cfg.get("base_url") or OLLAMA_URL
+        async with httpx.AsyncClient(timeout=5) as c:
+            resp = await c.get(f"{base_url}/api/tags")
+            resp.raise_for_status()
+            models = resp.json().get("models", [])
+            return [
+                {"name": m.get("name", ""), "size_gb": round(m.get("size", 0) / 1e9, 1)}
+                for m in models
+            ]
+    except Exception:
+        return []
+
+
+_DEFAULT_CLASSIFY_ERRORS = "You are a server monitoring assistant. Classify these errors in 1-2 sentences."
+_DEFAULT_SHOULD_SCALE = "You are a fleet scaling assistant. Answer YES or NO and one sentence why."
+
+
 async def classify_errors(errors: list[str]) -> str:
     try:
-        system = "You are a server monitoring assistant. Classify these errors in 1-2 sentences."
+        system = _get_prompt("classify_errors", _DEFAULT_CLASSIFY_ERRORS)
         user   = "\n".join(errors[:20])
         return await _chat(system, user, max_tokens=100)
     except Exception as e:
@@ -89,7 +121,7 @@ async def should_scale_out(metrics: dict, peer_states: dict) -> tuple[bool, str]
             for k, v in peer_states.items()
             if k != NODE_LABEL
         }
-        system = "You are a fleet scaling assistant. Answer YES or NO and one sentence why."
+        system = _get_prompt("should_scale_out", _DEFAULT_SHOULD_SCALE)
         user = (
             f"Fleet node {NODE_LABEL}: CPU={metrics['cpu_pct']}%, "
             f"MEM={metrics['mem_pct']}%, containers={metrics['containers_running']}, "

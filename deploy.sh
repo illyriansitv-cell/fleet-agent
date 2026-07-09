@@ -26,7 +26,7 @@ sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
   root@13.140.141.3:/tmp/fleet-agent-build/
 
 sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
-  agent/__init__.py agent/main.py agent/metrics.py agent/llm.py agent/bus.py agent/reporter.py \
+  agent/__init__.py agent/main.py agent/metrics.py agent/llm.py agent/bus.py agent/reporter.py agent/executor.py \
   root@13.140.141.3:/tmp/fleet-agent-build/agent/
 
 sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no root@13.140.141.3 "
@@ -55,6 +55,7 @@ for LABEL in de us au jp; do
       --restart unless-stopped \
       --network dokploy-network \
       -v /var/run/docker.sock:/var/run/docker.sock \
+      -v /etc/traefik:/etc/traefik \
       -e NODE_LABEL=$LABEL \
       -e REDIS_URL='$REDIS_URL' \
       -e FLEETDEPLOY_BACKEND_URL='$BACKEND_URL' \

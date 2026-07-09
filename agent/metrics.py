@@ -1,4 +1,5 @@
 import asyncio
+import json
 import psutil
 
 
@@ -44,3 +45,19 @@ async def collect() -> dict:
         "error_count_5m": error_count_5m,
         "recent_errors": recent_errors[:30],
     }
+
+
+async def collect_containers() -> list[dict]:
+    """Return list of running containers with name, status, image, ports."""
+    fmt = '{"name":"{{.Names}}","status":"{{.Status}}","image":"{{.Image}}","ports":"{{.Ports}}"}'
+    out = await _run(f"docker ps --format '{fmt}' 2>/dev/null")
+    result = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            result.append(json.loads(line))
+        except Exception:
+            pass
+    return result[:25]

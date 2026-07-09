@@ -40,6 +40,8 @@ ALLOWED_ACTIONS = {
     "fix_traefik_routes", # scan /etc/traefik/dynamic, fix stale container IPs
     "registry_cleanup",   # GC + prune on local registry (manager only)
     "swarm_health_report",# docker node ls → report node status
+    "ollama_pull",        # pull a model from Ollama registry or HuggingFace
+    "ollama_delete",      # delete a local Ollama model
     "noop",               # acknowledge, take no action
 }
 
@@ -287,6 +289,21 @@ async def _dispatch(action: dict) -> dict:
         rc, out, err = await _exec("docker node ls --format json 2>&1", timeout=15)
         return {"ok": rc == 0, "output": (out or err)[:2000]}
 
+    if atype == "ollama_pull":
+        model = str(action.get("model", "")).strip()
+        if not _safe_name(model):
+            return {"ok": False, "output": f"Unsafe model name: {model!r}"}
+        # Pull can take minutes — use a long timeout
+        rc, out, err = await _exec(f"ollama pull {shlex.quote(model)} 2>&1", timeout=600)
+        return {"ok": rc == 0, "output": (out or err)[:500]}
+
+    if atype == "ollama_delete":
+        model = str(action.get("model", "")).strip()
+        if not _safe_name(model):
+            return {"ok": False, "output": f"Unsafe model name: {model!r}"}
+        rc, out, err = await _exec(f"ollama rm {shlex.quote(model)} 2>&1", timeout=30)
+        return {"ok": rc == 0, "output": (out or err)[:300]}
+
     return {"ok": False, "output": f"Unhandled action type: {atype}"}
 
 
@@ -335,7 +352,7 @@ async def execute_directive(directive: str, metrics: dict) -> dict:
     action: dict = {"action_type": "noop"}
 
     try:
-        raw_plan = await _llm._chat(_CLASSIFY_SYSTEM, user_msg, max_tokens=300)
+        raw_plan = await _llm._chat(_llm._get_prompt("classify_directive", _CLASSIFY_SYSTEM), user_msg, max_tokens=300)
         # Strip markdown code fences if model adds them
         if raw_plan.startswith("```"):
             raw_plan = raw_plan.split("```")[1]

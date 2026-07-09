@@ -51,6 +51,9 @@ async def main():
     high_cpu_streak = 0
     last_peer_fetch = 0.0
     last_fd_health_check = 0.0
+    last_model_fetch = 0.0
+    cached_models: list = []
+    MODEL_FETCH_INTERVAL = 300  # refresh Ollama model list every 5 min
 
     async with httpx.AsyncClient(base_url=BACKEND_URL, headers=headers, timeout=15) as client:
         while True:
@@ -111,17 +114,30 @@ async def main():
                             f"[self-heal] {heal_msg}", {},
                         )
 
+                # Refresh Ollama models every 5 min
+                now = asyncio.get_event_loop().time()
+                if now - last_model_fetch >= MODEL_FETCH_INTERVAL:
+                    cached_models = await llm.list_ollama_models()
+                    last_model_fetch = now
+
+                # Collect running containers for admin visibility
+                containers = await metrics.collect_containers()
+
                 ip = socket.gethostbyname(socket.gethostname())
                 state = {**m, "status": status, "task": task, "node_label": NODE_LABEL, "ip": ip}
                 await bus.publish_state(redis, NODE_LABEL, state)
 
-                hb = await reporter.heartbeat(client, NODE_LABEL, m, status, task, peers)
+                gossip = {"peers": peers, "containers": containers, "ollama_models": cached_models}
+                hb = await reporter.heartbeat(client, NODE_LABEL, m, status, task, gossip)
                 directive    = hb.get("directive")   if hb else None
                 directive_id = hb.get("directive_id") if hb else None
-                # Update LLM config if backend sent new settings
+                # Update LLM config + prompt overrides if backend sent new settings
                 llm_config = hb.get("llm_config") if hb else None
                 if llm_config:
                     llm.update_config(llm_config)
+                agent_prompts = hb.get("agent_prompts") if hb else None
+                if agent_prompts:
+                    llm.update_prompts(agent_prompts)
 
                 if directive:
                     log.info(f"Directive received: {directive}")
