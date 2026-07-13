@@ -5,7 +5,7 @@ REGISTRY="13.140.141.3:5000"
 IMAGE="$REGISTRY/fleet-agent:latest"
 SSH_PASS="coza88nostra"
 BACKEND_URL="${FLEETDEPLOY_BACKEND_URL:-https://web-production-946ce.up.railway.app}"
-AGENT_SECRET="${AGENT_SECRET:-change-me}"
+AGENT_SECRET="${AGENT_SECRET:-1ccdd0ce8afe0a88b986342ea666441771fffd42d9b615e455fce78f311b55da}"
 CLAUDE_API_KEY="${CLAUDE_API_KEY:-}"
 
 declare -A NODES
