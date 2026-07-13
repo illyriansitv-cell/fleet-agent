@@ -53,7 +53,10 @@ async def main():
     last_fd_health_check = 0.0
     last_model_fetch = 0.0
     cached_models: list = []
-    MODEL_FETCH_INTERVAL = 300  # refresh Ollama model list every 5 min
+    MODEL_FETCH_INTERVAL = 300
+    # mutable thresholds — updated live from heartbeat agent_config
+    cpu_threshold = SCALE_CPU_THRESHOLD
+    scale_consecutive = SCALE_CONSECUTIVE
 
     async with httpx.AsyncClient(base_url=BACKEND_URL, headers=headers, timeout=15) as client:
         while True:
@@ -86,9 +89,9 @@ async def main():
                     )
                     task = "monitoring"
 
-                if m["cpu_pct"] > SCALE_CPU_THRESHOLD:
+                if m["cpu_pct"] > cpu_threshold:
                     high_cpu_streak += 1
-                    if high_cpu_streak >= SCALE_CONSECUTIVE:
+                    if high_cpu_streak >= scale_consecutive:
                         task = "scaling"
                         should, reason = await llm.should_scale_out(m, peers)
                         if should:
@@ -138,6 +141,12 @@ async def main():
                 agent_prompts = hb.get("agent_prompts") if hb else None
                 if agent_prompts:
                     llm.update_prompts(agent_prompts)
+                agent_config = hb.get("agent_config") if hb else None
+                if agent_config:
+                    if "scale_cpu_threshold" in agent_config:
+                        cpu_threshold = float(agent_config["scale_cpu_threshold"])
+                    if "scale_consecutive" in agent_config:
+                        scale_consecutive = int(agent_config["scale_consecutive"])
 
                 if directive:
                     log.info(f"Directive received: {directive}")
