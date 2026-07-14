@@ -70,7 +70,11 @@ async def _get_mongo_status() -> str:
         "--eval \"try{var s=rs.status();print(s.myState+' '+s.members.map(m=>m.stateStr).join(','))}catch(e){print('err:'+e.message)}\" 2>/dev/null",
         timeout=8,
     )
-    return (out or "query failed")[:200]
+    result = (out or "query failed").strip()
+    # Auth errors mean MongoDB is running and secured — not a problem to fix
+    if "requires authentication" in result or "Authentication failed" in result:
+        return "running (auth-protected — normal)"
+    return result[:200]
 
 
 async def _get_disk_info() -> str:
