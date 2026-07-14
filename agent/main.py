@@ -24,6 +24,21 @@ PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))
 FD_HEALTH_CHECK_INTERVAL = int(os.environ.get("FD_HEALTH_CHECK_INTERVAL", "300"))
 
 
+async def _prune_dead_swarm_nodes() -> str | None:
+    """
+    Manager-only: remove Down swarm nodes to prevent overlay IP pool exhaustion
+    and global-service scheduling chaos. Runs every 6 hours on the manager.
+    """
+    raw = await metrics._run("docker node ls --format '{{.ID}} {{.Status}}' 2>/dev/null")
+    dead = [line.split()[0] for line in raw.strip().splitlines()
+            if len(line.split()) >= 2 and line.split()[1].lower() == "down"]
+    if not dead:
+        return None
+    for node_id in dead:
+        await metrics._run(f"docker node rm {node_id} 2>/dev/null || true")
+    return f"pruned {len(dead)} dead Swarm node(s): {', '.join(dead[:5])}{'…' if len(dead) > 5 else ''}"
+
+
 async def _ensure_fd_health() -> str | None:
     """
     Check that the fd-health (whoami) container is running on this node.
@@ -52,8 +67,10 @@ async def main():
     last_peer_fetch = 0.0
     last_fd_health_check = 0.0
     last_model_fetch = 0.0
+    last_swarm_prune = 0.0
     cached_models: list = []
     MODEL_FETCH_INTERVAL = 300
+    SWARM_PRUNE_INTERVAL = 21600  # 6 hours — manager only
     # mutable thresholds — updated live from heartbeat agent_config
     cpu_threshold = SCALE_CPU_THRESHOLD
     scale_consecutive = SCALE_CONSECUTIVE
@@ -105,6 +122,17 @@ async def main():
                         task = "monitoring"
                 else:
                     high_cpu_streak = max(0, high_cpu_streak - 1)
+
+                now = asyncio.get_event_loop().time()
+                if NODE_LABEL == "de" and now - last_swarm_prune >= SWARM_PRUNE_INTERVAL:
+                    prune_msg = await _prune_dead_swarm_nodes()
+                    last_swarm_prune = now
+                    if prune_msg:
+                        log.warning(f"[self-heal] {prune_msg}")
+                        await reporter.log_event(
+                            client, NODE_LABEL, "action",
+                            f"[self-heal] {prune_msg}", {},
+                        )
 
                 now = asyncio.get_event_loop().time()
                 if now - last_fd_health_check >= FD_HEALTH_CHECK_INTERVAL:
