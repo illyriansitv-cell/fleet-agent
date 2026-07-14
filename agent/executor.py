@@ -223,9 +223,11 @@ async def _dispatch(action: dict) -> dict:
         return {"ok": True, "output": "Acknowledged — no action required."}
 
     if atype == "service_restart":
+        # Strip Docker task-ID suffix if present (e.g. "svc_name.abc123xyz" → "svc_name")
+        svc = re.sub(r'\.[a-z0-9]{10,}$', '', svc)
         if not _safe_name(svc):
             return {"ok": False, "output": f"Unsafe service name: {svc!r}"}
-        rc, out, err = await _exec(f"docker service update --force {shlex.quote(svc)}")
+        rc, out, err = await _exec(f"docker service update --force {shlex.quote(svc)}", timeout=120)
         return {"ok": rc == 0, "output": out or err}
 
     if atype == "service_scale":
