@@ -24,6 +24,43 @@ PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))
 FD_HEALTH_CHECK_INTERVAL = int(os.environ.get("FD_HEALTH_CHECK_INTERVAL", "300"))
 
 
+async def _ensure_ollama() -> str | None:
+    """Restart Ollama if stopped or missing — Qwen depends on it."""
+    status = await metrics._run(
+        "docker inspect ollama --format '{{.State.Running}}' 2>/dev/null"
+    )
+    if status.strip() == "true":
+        return None
+    await metrics._run(
+        "docker restart ollama 2>/dev/null || "
+        "docker run -d --name ollama --restart unless-stopped "
+        "--network dokploy-network -v ollama_data:/root/.ollama ollama/ollama:latest 2>/dev/null"
+    )
+    return f"ollama was {'stopped' if status.strip() == 'false' else 'missing'} — restarted"
+
+
+async def _ensure_redis() -> str | None:
+    """Restart Redis (dokploy-redis) if stopped — agents use it for peer gossip."""
+    status = await metrics._run(
+        "docker inspect dokploy-redis --format '{{.State.Running}}' 2>/dev/null"
+    )
+    if status.strip() == "true":
+        return None
+    # Try container restart first, fall back to Swarm service update
+    await metrics._run("docker restart dokploy-redis 2>/dev/null || true")
+    await asyncio.sleep(3)
+    status2 = await metrics._run(
+        "docker inspect dokploy-redis --format '{{.State.Running}}' 2>/dev/null"
+    )
+    if status2.strip() != "true":
+        svc = await metrics._run(
+            "docker service ls --format '{{.Name}}' 2>/dev/null | grep -i redis | head -1"
+        )
+        if svc.strip():
+            await metrics._run(f"docker service update --force {svc.strip()} 2>/dev/null || true")
+    return f"Redis was {'stopped' if status.strip() == 'false' else 'missing'} — restart attempted"
+
+
 async def _prune_dead_swarm_nodes() -> str | None:
     """
     Manager-only: remove Down swarm nodes to prevent overlay IP pool exhaustion
@@ -69,10 +106,16 @@ async def main():
     last_model_fetch = 0.0
     last_swarm_prune = 0.0
     last_qwen_heal = 0.0
+    last_ollama_check = 0.0
+    last_redis_check = 0.0
+    last_mongo_backup = 0.0
     cached_models: list = []
     MODEL_FETCH_INTERVAL = 300
-    SWARM_PRUNE_INTERVAL = 300  # 5 minutes — manager only
-    QWEN_HEAL_INTERVAL = 300    # 5 minutes — all nodes
+    SWARM_PRUNE_INTERVAL = 300   # 5 minutes — manager only
+    QWEN_HEAL_INTERVAL = 300     # 5 minutes — all nodes
+    OLLAMA_CHECK_INTERVAL = 300  # 5 minutes — all nodes
+    REDIS_CHECK_INTERVAL = 300   # 5 minutes — all nodes
+    MONGO_BACKUP_INTERVAL = 86400  # 24 hours — DE only
     # mutable thresholds — updated live from heartbeat agent_config
     cpu_threshold = SCALE_CPU_THRESHOLD
     scale_consecutive = SCALE_CONSECUTIVE
@@ -124,6 +167,33 @@ async def main():
                         task = "monitoring"
                 else:
                     high_cpu_streak = max(0, high_cpu_streak - 1)
+
+                # Ollama watchdog — all nodes
+                now = asyncio.get_event_loop().time()
+                if now - last_ollama_check >= OLLAMA_CHECK_INTERVAL:
+                    ollama_msg = await _ensure_ollama()
+                    last_ollama_check = now
+                    if ollama_msg:
+                        log.warning(f"[self-heal] {ollama_msg}")
+                        await reporter.log_event(client, NODE_LABEL, "action", f"[self-heal] {ollama_msg}", {})
+
+                # Redis watchdog — all nodes
+                now = asyncio.get_event_loop().time()
+                if now - last_redis_check >= REDIS_CHECK_INTERVAL:
+                    redis_msg = await _ensure_redis()
+                    last_redis_check = now
+                    if redis_msg:
+                        log.warning(f"[self-heal] {redis_msg}")
+                        await reporter.log_event(client, NODE_LABEL, "action", f"[self-heal] {redis_msg}", {})
+
+                # MongoDB backup — DE only, daily
+                now = asyncio.get_event_loop().time()
+                if NODE_LABEL == "de" and now - last_mongo_backup >= MONGO_BACKUP_INTERVAL:
+                    backup_msg = await healer.backup_mongodb()
+                    last_mongo_backup = now
+                    if backup_msg:
+                        log.info(f"[backup] {backup_msg}")
+                        await reporter.log_event(client, NODE_LABEL, "action", f"[backup] {backup_msg}", {})
 
                 now = asyncio.get_event_loop().time()
                 if NODE_LABEL == "de" and now - last_swarm_prune >= SWARM_PRUNE_INTERVAL:

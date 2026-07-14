@@ -2,11 +2,15 @@
 Local Qwen healer — runs every 5 min to proactively detect and fix VPS health issues.
 Always calls Ollama directly, completely independent of the configured LLM provider.
 """
+import asyncio
 import json
 import logging
 import os
 import re
 import shlex
+import ssl
+import socket
+from datetime import datetime
 
 import httpx
 
@@ -16,6 +20,9 @@ OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
 QWEN_HEAL_MODEL = os.environ.get("QWEN_HEAL_MODEL", "qwen2.5-coder:1.5b")
 NODE_LABEL = os.environ.get("NODE_LABEL", "?")
 
+# Domains to monitor for SSL expiry and HTTP reachability
+MONITOR_DOMAINS = os.environ.get("MONITOR_DOMAINS", "ulitar.com").split(",")
+
 DEFAULT_HEAL_PROMPT = (
     "You are an autonomous VPS health monitor on node {node_label}.\n"
     "Analyze the system state and decide if a fix is needed.\n"
@@ -24,12 +31,15 @@ DEFAULT_HEAL_PROMPT = (
     'If a fix is needed: {"ok": false, "reason": "<what is wrong>", '
     '"action": {"action_type": "<type>", "<param>": "<value>"}}\n\n'
     "Available action_types:\n"
-    '- container_restart: restart a stopped/crashed container. Add "container_name": "<name>"\n'
+    '- container_restart: restart a stopped/OOM-killed container. Add "container_name": "<name>"\n'
     '- service_restart: restart a Docker Swarm service. Add "service_name": "<name>"\n'
-    "- disk_cleanup: run docker system prune -f  (use only when disk > 85%)\n"
-    '- shell_safe: run a safe targeted shell command. Add "command": "<cmd>"\n'
-    "  Examples: \"docker exec mongo mongosh --eval 'rs.initiate()'\", "
-    '"docker network prune -f", "docker volume prune -f"\n\n'
+    "- disk_cleanup: run docker system prune -f  (only when disk > 85%)\n"
+    '- shell_safe: run a safe targeted command. Add "command": "<cmd>"\n'
+    "  Examples: \"docker network prune -f\", \"docker volume prune -f\"\n\n"
+    "INFO-ONLY (do not try to fix — just log if bad):\n"
+    "- SSL expiry warnings: these are external, no local fix possible\n"
+    "- HTTP reachability failures: network/upstream issue, no local fix\n"
+    "  For these: respond {\"ok\": false, \"reason\": \"<issue>\", \"action\": null}\n\n"
     "NEVER suggest: rm -rf, dd, mkfs, format, drop database, curl|bash, wget|bash\n"
     'When in doubt: respond {"ok": true}\n'
     "Only act on clear, obvious problems you are confident about."
@@ -37,7 +47,6 @@ DEFAULT_HEAL_PROMPT = (
 
 
 async def _run(cmd: str, timeout: int = 10) -> str:
-    import asyncio
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd,
@@ -58,11 +67,20 @@ async def _get_stopped_containers() -> str:
     return out or "none"
 
 
-async def _get_mongo_status() -> str:
-    ctr = await _run(
-        "docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'mongo' | head -1"
+async def _get_oom_killed() -> str:
+    """Find containers killed by OOM — exit code 137 or OOMKilled=true."""
+    out = await _run(
+        "docker ps -a -q 2>/dev/null | xargs -r docker inspect "
+        "--format '{{.Name}} restarts={{.RestartCount}} oom={{.State.OOMKilled}}' 2>/dev/null "
+        "| grep 'oom=true' | sed 's|/||' | head -5"
     )
-    ctr = ctr.strip()
+    return out.strip() or "none"
+
+
+async def _get_mongo_status() -> str:
+    ctr = (await _run(
+        "docker ps --format '{{.Names}}' 2>/dev/null | grep -iE 'mongo' | head -1"
+    )).strip()
     if not ctr:
         return "not on this node"
     out = await _run(
@@ -71,7 +89,6 @@ async def _get_mongo_status() -> str:
         timeout=8,
     )
     result = (out or "query failed").strip()
-    # Auth errors mean MongoDB is running and secured — not a problem to fix
     if "requires authentication" in result or "Authentication failed" in result:
         return "running (auth-protected — normal)"
     return result[:200]
@@ -88,6 +105,44 @@ async def _get_swarm_down() -> str:
         "| grep -i down | head -5"
     )
     return out or "none"
+
+
+async def _check_ssl(domains: list[str]) -> str:
+    """Check SSL cert expiry using Python ssl — no openssl CLI needed."""
+    results = []
+    for domain in domains:
+        try:
+            ctx = ssl.create_default_context()
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(domain, 443, ssl=ctx, server_hostname=domain),
+                timeout=8,
+            )
+            cert = writer.get_extra_info("ssl_object").getpeercert()
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            exp = datetime.strptime(cert["notAfter"], "%b %d %H:%M:%S %Y %Z")
+            days = (exp - datetime.utcnow()).days
+            results.append(f"{domain}:{'OK(' + str(days) + 'd)' if days >= 14 else 'EXPIRING IN ' + str(days) + 'd!'}")
+        except Exception:
+            results.append(f"{domain}:check-failed")
+    return " ".join(results) or "skipped"
+
+
+async def _check_http(domains: list[str]) -> str:
+    """HTTP reachability check — report failures only."""
+    results = []
+    async with httpx.AsyncClient(timeout=10, follow_redirects=True) as c:
+        for domain in domains:
+            try:
+                r = await c.get(f"https://{domain}")
+                if r.status_code >= 500:
+                    results.append(f"{domain}:{r.status_code}")
+            except Exception:
+                results.append(f"{domain}:UNREACHABLE")
+    return " ".join(results) if results else "all reachable"
 
 
 def _fmt_peers(peers: dict) -> str:
@@ -113,19 +168,27 @@ async def run_heal_check(
     """
     Run a Qwen health analysis. Returns event-ready dict or None if healthy / Ollama offline.
     """
-    stopped = await _get_stopped_containers()
-    mongo = await _get_mongo_status()
-    disk = await _get_disk_info()
-    swarm_down = await _get_swarm_down()
+    stopped, oom, mongo, disk, swarm_down, ssl_status, http_status = await asyncio.gather(
+        _get_stopped_containers(),
+        _get_oom_killed(),
+        _get_mongo_status(),
+        _get_disk_info(),
+        _get_swarm_down(),
+        _check_ssl(MONITOR_DOMAINS),
+        _check_http(MONITOR_DOMAINS),
+    )
 
     context = (
         f"NODE:{NODE_LABEL} CPU:{metrics.get('cpu_pct', 0):.0f}% "
         f"MEM:{metrics.get('mem_pct', 0):.0f}% DISK:{metrics.get('disk_pct', 0):.0f}%\n"
         f"ERRORS_5m:{metrics.get('error_count_5m', 0)}\n"
         f"STOPPED:\n{stopped}\n"
+        f"OOM_KILLED:{oom}\n"
         f"SWARM_DOWN:{swarm_down}\n"
         f"MONGO:{mongo}\n"
         f"DISK:{disk}\n"
+        f"SSL:{ssl_status}\n"
+        f"HTTP:{http_status}\n"
         f"PEERS:\n{_fmt_peers(peers)}"
     )
 
@@ -144,7 +207,6 @@ async def run_heal_check(
         log.debug(f"Qwen heal: Ollama unavailable — {e}")
         return None
 
-    # Parse JSON (strip markdown fences if model wraps response)
     try:
         text = raw
         if "```" in text:
@@ -166,12 +228,13 @@ async def run_heal_check(
     action = result.get("action")
 
     if not action or not isinstance(action, dict):
-        log.info(f"Qwen heal: flagged '{reason}' but returned no action")
+        # Info-only event (SSL expiry, HTTP issue, etc.)
+        log.info(f"Qwen heal: flagged '{reason}' — no action")
         return {
             "acted": False,
             "reason": reason,
             "action_type": "none",
-            "output": "no action suggested",
+            "output": "info only — no local fix possible",
             "ok": False,
         }
 
@@ -187,3 +250,62 @@ async def run_heal_check(
         "output": res.get("output", "")[:500],
         "ok": res.get("ok", False),
     }
+
+
+async def backup_mongodb() -> str | None:
+    """
+    Daily MongoDB backup to /var/backups/mongodb/ — keep last 7 days.
+    Called from main.py on DE node only.
+    """
+    ctr = (await _run(
+        "docker ps --format '{{.Names}}' 2>/dev/null | grep -i mongo | head -1"
+    )).strip()
+    if not ctr:
+        return None
+
+    date_str = datetime.utcnow().strftime("%Y%m%d")
+    backup_dir = "/var/backups/mongodb"
+    backup_file = f"{backup_dir}/backup-{date_str}.gz"
+
+    await _run(f"mkdir -p {backup_dir}")
+
+    # Try to get credentials from container environment
+    env_raw = await _run(
+        f"docker inspect {shlex.quote(ctr)} --format '{{{{json .Config.Env}}}}' 2>/dev/null"
+    )
+    username = password = ""
+    try:
+        for ev in json.loads(env_raw):
+            if ev.startswith("MONGO_INITDB_ROOT_USERNAME="):
+                username = ev.split("=", 1)[1]
+            elif ev.startswith("MONGO_INITDB_ROOT_PASSWORD="):
+                password = ev.split("=", 1)[1]
+    except Exception:
+        pass
+
+    auth = (
+        f"--username {shlex.quote(username)} --password {shlex.quote(password)} "
+        "--authenticationDatabase admin"
+        if username and password else ""
+    )
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f"docker exec {shlex.quote(ctr)} mongodump {auth} --archive --gzip 2>/dev/null "
+            f"> {backup_file}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        return "MongoDB backup timed out after 5 min"
+    except Exception as e:
+        return f"MongoDB backup error: {e}"
+
+    # Keep last 7 backups
+    await _run(
+        f"ls -t {backup_dir}/backup-*.gz 2>/dev/null | tail -n +8 | xargs rm -f 2>/dev/null || true"
+    )
+
+    size = await _run(f"du -sh {backup_file} 2>/dev/null | cut -f1")
+    return f"MongoDB backup: {size or '?'} → {backup_file}"
