@@ -7,7 +7,7 @@ import socket
 import httpx
 import redis.asyncio as aioredis
 
-from . import metrics, llm, bus, reporter
+from . import metrics, llm, bus, reporter, healer
 from .executor import _dispatch
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -68,9 +68,11 @@ async def main():
     last_fd_health_check = 0.0
     last_model_fetch = 0.0
     last_swarm_prune = 0.0
+    last_qwen_heal = 0.0
     cached_models: list = []
     MODEL_FETCH_INTERVAL = 300
-    SWARM_PRUNE_INTERVAL = 21600  # 6 hours — manager only
+    SWARM_PRUNE_INTERVAL = 300  # 5 minutes — manager only
+    QWEN_HEAL_INTERVAL = 300    # 5 minutes — all nodes
     # mutable thresholds — updated live from heartbeat agent_config
     cpu_threshold = SCALE_CPU_THRESHOLD
     scale_consecutive = SCALE_CONSECUTIVE
@@ -175,6 +177,32 @@ async def main():
                         cpu_threshold = float(agent_config["scale_cpu_threshold"])
                     if "scale_consecutive" in agent_config:
                         scale_consecutive = int(agent_config["scale_consecutive"])
+
+                # Qwen local health check — runs on all nodes every 5 min
+                now = asyncio.get_event_loop().time()
+                if now - last_qwen_heal >= QWEN_HEAL_INTERVAL:
+                    heal_prompt = (agent_prompts or {}).get("qwen_heal_prompt")
+                    heal_result = await healer.run_heal_check(m, peers, containers, heal_prompt)
+                    last_qwen_heal = now
+                    if heal_result:
+                        atype = heal_result.get("action_type", "?")
+                        prefix = f"[{atype}]" if heal_result.get("acted") else "[observed]"
+                        ok_str = "OK" if heal_result.get("ok") else ("FAILED" if heal_result.get("acted") else "no action")
+                        msg = (
+                            f"{prefix} {heal_result['reason'][:80]} → "
+                            f"{ok_str}: {heal_result.get('output', '')[:100]}"
+                        )
+                        log.info(f"[qwen-heal] {msg}")
+                        await reporter.log_event(
+                            client, NODE_LABEL, "qwen_heal", msg,
+                            {
+                                "acted": heal_result.get("acted", False),
+                                "reason": heal_result.get("reason", ""),
+                                "action_type": atype,
+                                "ok": heal_result.get("ok", False),
+                                "output": heal_result.get("output", "")[:500],
+                            },
+                        )
 
                 if directive:
                     log.info(f"Directive received: {directive}")

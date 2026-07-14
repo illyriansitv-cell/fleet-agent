@@ -42,8 +42,24 @@ ALLOWED_ACTIONS = {
     "swarm_health_report",# docker node ls → report node status
     "ollama_pull",        # pull a model from Ollama registry or HuggingFace
     "ollama_delete",      # delete a local Ollama model
+    "shell_safe",          # Qwen-generated targeted shell command (blocklisted for dangerous patterns)
     "noop",               # acknowledge, take no action
 }
+
+# Blocklist for shell_safe — reject anything matching these patterns
+_SHELL_BLOCKLIST = re.compile(
+    r"rm\s+(-[a-zA-Z]*r|--recursive)"   # rm -r / rm -rf / rm --recursive
+    r"|dd\s+.*if="                        # dd if=...
+    r"|\bmkfs\b"                          # format filesystem
+    r"|>\s*/dev/[a-z]"                   # redirect to raw device
+    r"|wget\s+.*\|\s*(?:ba)?sh"          # wget | bash
+    r"|curl\s+.*\|\s*(?:ba)?sh"          # curl | bash
+    r"|\bdrop\s+database\b"              # SQL drop
+    r"|:()\s*\{"                          # fork bomb
+    r"|\bshred\b"                         # shred command
+    r"|\bfdisk\b",                        # partition editor
+    re.IGNORECASE,
+)
 
 # Registry allowlist for image_pull — prevents arbitrary pulls
 _SAFE_REGISTRIES = {
@@ -303,6 +319,15 @@ async def _dispatch(action: dict) -> dict:
             return {"ok": False, "output": f"Unsafe model name: {model!r}"}
         rc, out, err = await _exec(f"ollama rm {shlex.quote(model)} 2>&1", timeout=30)
         return {"ok": rc == 0, "output": (out or err)[:300]}
+
+    if atype == "shell_safe":
+        cmd = str(action.get("command", "")).strip()
+        if not cmd:
+            return {"ok": False, "output": "shell_safe: no command provided"}
+        if _SHELL_BLOCKLIST.search(cmd):
+            return {"ok": False, "output": f"shell_safe: blocked dangerous pattern — {cmd[:100]}"}
+        rc, out, err = await _exec(cmd, timeout=30)
+        return {"ok": rc == 0, "output": (out or err or "done")[:1000]}
 
     return {"ok": False, "output": f"Unhandled action type: {atype}"}
 
