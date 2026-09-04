@@ -26,7 +26,7 @@ sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
   root@13.140.141.3:/tmp/fleet-agent-build/
 
 sshpass -p "$SSH_PASS" scp -o StrictHostKeyChecking=no \
-  agent/__init__.py agent/main.py agent/metrics.py agent/llm.py agent/bus.py agent/reporter.py agent/executor.py \
+  agent/__init__.py agent/main.py agent/metrics.py agent/llm.py agent/bus.py agent/reporter.py agent/executor.py agent/healer.py \
   root@13.140.141.3:/tmp/fleet-agent-build/agent/
 
 sshpass -p "$SSH_PASS" ssh -o StrictHostKeyChecking=no root@13.140.141.3 "
