@@ -65,19 +65,30 @@ async def _chat(system_prompt: str, user_msg: str, max_tokens: int = 300) -> str
 
     if provider == "gemini":
         base_url = _cfg.get("base_url") or "https://generativelanguage.googleapis.com/v1beta/openai"
+        _GEMINI_FALLBACK = "gemini-3.6-flash"
+        payload = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ],
+            "max_tokens": max_tokens,
+        }
         async with httpx.AsyncClient(timeout=30) as c:
             resp = await c.post(
                 f"{base_url}/chat/completions",
                 headers={"Authorization": f"Bearer {api_key}"},
-                json={
-                    "model": model,
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_msg},
-                    ],
-                    "max_tokens": max_tokens,
-                },
+                json=payload,
             )
+            # Auto-retry with fallback model if configured model is deprecated
+            if resp.status_code == 404 and model != _GEMINI_FALLBACK:
+                log.warning("Gemini model %r deprecated (404), retrying with %s", model, _GEMINI_FALLBACK)
+                payload["model"] = _GEMINI_FALLBACK
+                resp = await c.post(
+                    f"{base_url}/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json=payload,
+                )
             if not resp.is_success:
                 body = resp.text[:300]
                 raise RuntimeError(f"Gemini API {resp.status_code}: {body}")
