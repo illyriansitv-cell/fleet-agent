@@ -78,8 +78,14 @@ async def _chat(system_prompt: str, user_msg: str, max_tokens: int = 300) -> str
                     "max_tokens": max_tokens,
                 },
             )
-            resp.raise_for_status()
-            return resp.json()["choices"][0]["message"]["content"].strip()
+            if not resp.is_success:
+                body = resp.text[:300]
+                raise RuntimeError(f"Gemini API {resp.status_code}: {body}")
+            data = resp.json()
+            choices = data.get("choices") or []
+            if not choices:
+                raise RuntimeError(f"Gemini returned no choices: {data}")
+            return choices[0]["message"]["content"].strip()
 
     raise ValueError(f"Unknown LLM provider: {provider!r}")
 
