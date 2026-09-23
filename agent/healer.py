@@ -1,6 +1,6 @@
 """
-Local Qwen healer — runs every 5 min to proactively detect and fix VPS health issues.
-Always calls Ollama directly, completely independent of the configured LLM provider.
+AI healer — runs every 5 min to proactively detect and fix VPS health issues.
+Uses the configured LLM provider (Gemini by default).
 """
 import asyncio
 import json
@@ -14,10 +14,10 @@ from datetime import datetime
 
 import httpx
 
+from . import llm as _llm
+
 log = logging.getLogger("fleet-agent.healer")
 
-OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://ollama:11434")
-QWEN_HEAL_MODEL = os.environ.get("QWEN_HEAL_MODEL", "qwen2.5-coder:1.5b")
 NODE_LABEL = os.environ.get("NODE_LABEL", "?")
 
 # Domains to monitor for SSL expiry and HTTP reachability
@@ -193,18 +193,12 @@ async def run_heal_check(
     )
 
     system = (heal_prompt or DEFAULT_HEAL_PROMPT).replace("{node_label}", NODE_LABEL)
-    prompt = f"{system}\n\nSYSTEM STATE:\n{context}"
 
     try:
-        async with httpx.AsyncClient(timeout=45) as c:
-            resp = await c.post(
-                f"{OLLAMA_URL}/api/generate",
-                json={"model": QWEN_HEAL_MODEL, "prompt": prompt, "stream": False},
-            )
-            resp.raise_for_status()
-            raw = resp.json().get("response", "").strip()
+        raw = await _llm._chat(system, f"SYSTEM STATE:\n{context}", max_tokens=400)
+        raw = (raw or "").strip()
     except Exception as e:
-        log.debug(f"Qwen heal: Ollama unavailable — {e}")
+        log.debug(f"Heal check: LLM unavailable — {e}")
         return None
 
     try:

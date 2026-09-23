@@ -24,20 +24,6 @@ PEER_FETCH_INTERVAL = int(os.environ.get("PEER_FETCH_INTERVAL", "300"))
 FD_HEALTH_CHECK_INTERVAL = int(os.environ.get("FD_HEALTH_CHECK_INTERVAL", "300"))
 
 
-async def _ensure_ollama() -> str | None:
-    """Restart Ollama if stopped or missing — Qwen depends on it."""
-    status = await metrics._run(
-        "docker inspect ollama --format '{{.State.Running}}' 2>/dev/null"
-    )
-    if status.strip() == "true":
-        return None
-    await metrics._run(
-        "docker restart ollama 2>/dev/null || "
-        "docker run -d --name ollama --restart unless-stopped "
-        "--network dokploy-network -v ollama_data:/root/.ollama ollama/ollama:latest 2>/dev/null"
-    )
-    return f"ollama was {'stopped' if status.strip() == 'false' else 'missing'} — restarted"
-
 
 async def _ensure_redis() -> str | None:
     """Restart Redis (dokploy-redis) if stopped — agents use it for peer gossip."""
@@ -103,17 +89,12 @@ async def main():
     high_cpu_streak = 0
     last_peer_fetch = 0.0
     last_fd_health_check = 0.0
-    last_model_fetch = 0.0
     last_swarm_prune = 0.0
     last_qwen_heal = 0.0
-    last_ollama_check = 0.0
     last_redis_check = 0.0
     last_mongo_backup = 0.0
-    cached_models: list = []
-    MODEL_FETCH_INTERVAL = 300
     SWARM_PRUNE_INTERVAL = 300   # 5 minutes — manager only
     QWEN_HEAL_INTERVAL = 300     # 5 minutes — all nodes
-    OLLAMA_CHECK_INTERVAL = 300  # 5 minutes — all nodes
     REDIS_CHECK_INTERVAL = 300   # 5 minutes — all nodes
     MONGO_BACKUP_INTERVAL = 86400  # 24 hours — DE only
     # mutable thresholds — updated live from heartbeat agent_config
@@ -168,15 +149,6 @@ async def main():
                 else:
                     high_cpu_streak = max(0, high_cpu_streak - 1)
 
-                # Ollama watchdog — all nodes
-                now = asyncio.get_event_loop().time()
-                if now - last_ollama_check >= OLLAMA_CHECK_INTERVAL:
-                    ollama_msg = await _ensure_ollama()
-                    last_ollama_check = now
-                    if ollama_msg:
-                        log.warning(f"[self-heal] {ollama_msg}")
-                        await reporter.log_event(client, NODE_LABEL, "action", f"[self-heal] {ollama_msg}", {})
-
                 # Redis watchdog — all nodes
                 now = asyncio.get_event_loop().time()
                 if now - last_redis_check >= REDIS_CHECK_INTERVAL:
@@ -217,12 +189,6 @@ async def main():
                             f"[self-heal] {heal_msg}", {},
                         )
 
-                # Refresh Ollama models every 5 min
-                now = asyncio.get_event_loop().time()
-                if now - last_model_fetch >= MODEL_FETCH_INTERVAL:
-                    cached_models = await llm.list_ollama_models()
-                    last_model_fetch = now
-
                 # Collect running containers for admin visibility
                 containers = await metrics.collect_containers()
 
@@ -230,7 +196,7 @@ async def main():
                 state = {**m, "status": status, "task": task, "node_label": NODE_LABEL, "ip": ip}
                 await bus.publish_state(redis, NODE_LABEL, state)
 
-                gossip = {"peers": peers, "containers": containers, "ollama_models": cached_models}
+                gossip = {"peers": peers, "containers": containers}
                 hb = await reporter.heartbeat(client, NODE_LABEL, m, status, task, gossip)
                 directive    = hb.get("directive")   if hb else None
                 directive_id = hb.get("directive_id") if hb else None
