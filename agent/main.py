@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import logging
+import signal
 import socket
 
 import httpx
@@ -283,4 +284,22 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    def _shutdown(sig, frame):
+        log.info(f"Fleet agent shutting down (signal {sig})")
+        for task in asyncio.all_tasks(loop):
+            task.cancel()
+        loop.stop()
+
+    signal.signal(signal.SIGTERM, _shutdown)
+    signal.signal(signal.SIGINT, _shutdown)
+
+    try:
+        loop.run_until_complete(main())
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
+    finally:
+        log.info("Fleet agent stopped")
+        loop.close()
